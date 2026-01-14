@@ -29,6 +29,18 @@ This approach enables:
 - **Multiple payment options** (basic, premium, ultra tiers)
 - **Clean separation** between business logic and payment logic
 
+## 📦 Supported Payment Schemes
+
+### MultiversX (mvx) - Relayed Transactions V3
+Enables "Gasless" payments where the credentials provider pays the network fees.
+
+```python
+from x402_a2a.schemes.multiversx import MultiversXScheme
+scheme = MultiversXScheme(chain_id="1") # Mainnet
+```
+
+Requirements: `pip install "x402-a2a[multiversx]"`
+
 ## Architecture Overview
 
 The package follows a "functional core, imperative shell" architecture. The core protocol is implementation-agnostic and can be used independently, while executors provide optional middleware for common integration patterns.
