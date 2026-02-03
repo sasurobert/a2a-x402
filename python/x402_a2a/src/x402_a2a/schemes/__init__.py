@@ -17,4 +17,6 @@
 # This file can be used to export supported schemes.
 # Currently exporting MultiversXScheme.
 
-# from .multiversx import MultiversXScheme 
+from .multiversx import MultiversXScheme
+
+__all__ = ["MultiversXScheme"]

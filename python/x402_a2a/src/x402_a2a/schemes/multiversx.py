@@ -12,25 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Optional, Union
-import json
 import base64
-from x402.types import PaymentRequirements, PaymentPayload
-from multiversx_sdk_core import Transaction, Address, TransactionComputer
-from multiversx_sdk_wallet import UserSigner
+import time
+from typing import Any, Dict, Optional, Union, Protocol
+
+from x402.types import PaymentPayload, PaymentRequirements
+
+# User /mvx-python-specialist patterns (SDK v2)
+from multiversx_sdk import (
+    Address,
+    TransactionsFactoryConfig,
+    TransferTransactionsFactory,
+)
+
+from .multiversx_config import MultiversXConfig
+
+class ISigner(Protocol):
+    """Protocol for MultiversX transaction signers."""
+    def sign_transaction(self, tx: Any) -> bytes: ...
 
 class MultiversXScheme:
     """
     Implements the x402 payment scheme for MultiversX (mvx) with Relayed V3 support.
+    Aligned with the 'Exact' scheme implementation logic.
     """
-    SCHEME_NAME = "mvx"
+    SCHEME_NAME: str = "mvx"
 
-    def __init__(self, chain_id: str = "1"):
+    def __init__(self, chain_id: str = "1", config: Optional[MultiversXConfig] = None):
+        """
+        Initializes the MultiversX scheme.
+        
+        Args:
+            chain_id: The MultiversX chain ID (e.g., "1" for Mainnet, "D" for Devnet).
+            config: Optional specialized configuration for protocol constants.
+        """
         self.chain_id = chain_id
-        # Relayed V3 gas limit base is 50k + 50k + data. 
-        # We set a safe default for the inner transaction.
-        self.gas_limit_inner = 500000 
-        self.tx_computer = TransactionComputer()
+        self.config = config or MultiversXConfig()
+        factory_config = TransactionsFactoryConfig(chain_id=chain_id)
+        self.factory = TransferTransactionsFactory(config=factory_config)
 
     def create_payment_requirements(
         self,
@@ -38,14 +57,33 @@ class MultiversXScheme:
         token_identifier: str,
         receiver: str,
         resource: str = "",
-        description: str = ""
+        description: str = "",
+        max_timeout_seconds: Optional[int] = None
     ) -> PaymentRequirements:
         """
         [Functional Core] Generates the PaymentRequirements for MultiversX.
-        The data field for ESDT transfer is pre-calculated here.
-        """
-        esdt_data = self._construct_esdt_data(token_identifier, amount)
         
+        Args:
+            amount: Amount in atomic units.
+            token_identifier: Token ID (e.g., "EGLD", or "USDC-c76f1f").
+            receiver: Bech32 address of the recipient.
+            resource: The resource being paid for.
+            description: Human-readable description.
+            max_timeout_seconds: Payment validity timeout.
+        """
+        timeout = max_timeout_seconds or self.config.DEFAULT_TIMEOUT_SECONDS
+        is_egld = token_identifier == "EGLD"
+        transfer_method = (
+            self.config.TRANSFER_METHOD_DIRECT if is_egld 
+            else self.config.TRANSFER_METHOD_ESDT
+        )
+        
+        data_payload = self._construct_transfer_data_string(
+            token_identifier, amount, receiver
+        )
+        
+        gas_limit = self.calculate_gas_limit(data_payload, token_identifier)
+
         return PaymentRequirements(
             scheme=self.SCHEME_NAME,
             network=f"mvx:{self.chain_id}",
@@ -54,65 +92,86 @@ class MultiversXScheme:
             max_amount_required=str(amount),
             resource=resource,
             description=description,
-            max_timeout_seconds=600,
+            max_timeout_seconds=timeout,
             mime_type="application/json",
             extra={
-                "data_payload": esdt_data,
-                "chain_id": self.chain_id
+                "data_payload": data_payload,
+                "chain_id": self.chain_id,
+                "assetTransferMethod": transfer_method,
+                "gasLimit": gas_limit
             }
         )
 
     def construct_payment_payload(
         self,
         requirements: PaymentRequirements,
-        signer: UserSigner, # signer interface from simple-wallet
+        signer: ISigner,
         sender_address: str,
         nonce: int
     ) -> PaymentPayload:
         """
-        [Functional Core/Shell] Signs the Inner Transaction and returns PaymentPayload.
-        Note: signer is passed in, matching a2a-x402 wallet.py pattern but using MX SDK.
-        """
-        # 1. Reconstruct data from requirements
-        data_payload = requirements.extra.get("data_payload", "")
-        if not data_payload:
-            # Fallback if extra missing, reconstruct
-            data_payload = self._construct_esdt_data(
-                requirements.asset, 
-                int(requirements.max_amount_required)
-            )
-
-        # 2. Construct Inner Transaction
-        # Relayed Transaction V3 Inner Tx:
-        # Value must be 0 for ESDT transfer (handled via data field)
-        # Note: SDK 0.8.x Transaction expects strings for sender/receiver, and bytes for data
-        tx = Transaction(
-            nonce=nonce,
-            value=0,
-            sender=sender_address,
-            receiver=requirements.pay_to,
-            gas_limit=self.gas_limit_inner,
-            data=data_payload.encode(),
-            chain_id=self.chain_id,
-            version=2 
-        )
-
-        # 3. Sign
-        # Getbytes for signing using TransactionComputer
-        tx_bytes = self.tx_computer.compute_bytes_for_signing(tx)
-        signature = signer.sign(tx_bytes)
-        tx.signature = signature
-
-        # 4. Construct Payload Dictionary matching Relayed V3 expectation
-        # The payload delivered to the Relayer (CP) needs to be the inner tx fields + signature.
-        # Use TransactionComputer internal method to get dict
-        payload_dict = self.tx_computer._to_dictionary(tx)
+        [Functional Core/Shell] Constructs and signs the transaction.
         
-        # Ensure signature is hex string for the payload
-        if isinstance(payload_dict.get("signature"), bytes):
-            payload_dict["signature"] = payload_dict["signature"].hex()
-        elif hasattr(tx.signature, "hex"):
-             payload_dict["signature"] = tx.signature.hex()
+        Args:
+            requirements: The original payment requirements.
+            signer: An object implementing ISigner (e.g., multiversx_sdk.Account).
+            sender_address: Bech32 address of the payer.
+            nonce: Transaction nonce for the sender.
+        """
+        now = int(time.time())
+        data_payload = requirements.extra.get("data_payload", "")
+        
+        transfer_method = requirements.extra.get("assetTransferMethod")
+        relayer = requirements.extra.get("relayer")
+        
+        # Version 1 for direct value transfer, Version 2 for Relayed V3
+        version = 1 if transfer_method == self.config.TRANSFER_METHOD_DIRECT else 2
+        
+        is_egld = requirements.asset == "EGLD"
+        sender_addr_obj = Address.new_from_bech32(sender_address)
+        
+        if is_egld:
+            tx = self.factory.create_transaction_for_native_token_transfer(
+                sender=sender_addr_obj,
+                receiver=Address.new_from_bech32(requirements.payTo),
+                native_amount=int(requirements.max_amount_required)
+            )
+        else:
+            # MultiESDTNFTTransfer logic: sender is receiver in the top-level tx
+            tx = self.factory.create_transaction_for_native_token_transfer(
+                sender=sender_addr_obj,
+                receiver=sender_addr_obj,
+                native_amount=0
+            )
+        
+        tx.nonce = nonce
+        tx.data = data_payload.encode()
+        tx.gas_limit = requirements.extra.get("gasLimit", self.config.GAS_BASE_COST)
+        tx.version = version
+        
+        if relayer:
+            tx.relayer = Address.new_from_bech32(relayer)
+
+        # Signing (Manual signing using SDK v2 patterns)
+        tx.signature = signer.sign_transaction(tx)
+
+        payload_dict = {
+            "nonce": tx.nonce,
+            "value": str(tx.value),
+            "receiver": tx.receiver.bech32(),
+            "sender": tx.sender.bech32(),
+            "gasPrice": tx.gas_price or self.config.GAS_PRICE_DEFAULT,
+            "gasLimit": tx.gas_limit,
+            "data": data_payload,
+            "chainID": tx.chain_id,
+            "version": tx.version,
+            "signature": tx.signature.hex(),
+            "validAfter": now - 600, # Standard buffer
+            "validBefore": now + (requirements.max_timeout_seconds or self.config.DEFAULT_TIMEOUT_SECONDS)
+        }
+        
+        if relayer:
+            payload_dict["relayer"] = relayer
 
         return PaymentPayload(
             x402_version=1,
@@ -121,32 +180,93 @@ class MultiversXScheme:
             payload=payload_dict
         )
 
-    def _construct_esdt_data(self, token_identifier: str, amount: int) -> str:
+    def verify_transaction_content(self, tx_data: Dict[str, Any], request: PaymentRequirements) -> bool:
         """
-        Helper to construct ESDTTransfer data field.
-        Format: ESDTTransfer@<TokenHex>@<AmountHex>
-        """
-        if token_identifier == "EGLD":
-            return "" # EGLD transfer doesn't use data field for value
-            
-        # Token Identifier to Hex
-        token_hex = token_identifier.encode().hex()
+        [GREEN] Verifies that a fetched transaction matches the payment request.
         
-        # Amount to Hex (even length)
-        # If amount is 0, it should be just "00" or empty? Typically "00" or logic handles it.
-        # However, ESDTTransfer requires amount.
+        Args:
+            tx_data: Dictionary representing the transaction data from a network provider.
+            request: The original payment requirements to verify against.
+        """
+        # 1. Verify Receiver
+        is_egld = request.asset == "EGLD"
+        if is_egld:
+            if tx_data.get("receiver") != request.pay_to:
+                return False
+        else:
+            # For MultiESDT, tx.receiver is usually the sender or the pay_to 
+            # depending on whether it's relayed or direct.
+            actual_receiver = tx_data.get("receiver")
+            actual_sender = tx_data.get("sender")
+            if actual_receiver != actual_sender and actual_receiver != request.pay_to:
+                 return False
+
+        # 2. Verify Data Field
+        expected_data = request.extra.get("data_payload", "")
+        actual_data_raw = tx_data.get("data", "")
+        
+        actual_data = self._decode_transaction_data(actual_data_raw)
+        if actual_data != expected_data:
+            return False
+            
+        # 3. Verify Status
+        if tx_data.get("status") != "success":
+            return False
+            
+        return True
+
+    def calculate_gas_limit(self, data_string: str, token_identifier: str) -> int:
+        """
+        Calculates gas limit based on the specialized 'Exact' formula.
+        """
+        data_len = len(data_string.encode())
+        gas_limit = (
+            self.config.GAS_BASE_COST +
+            (self.config.GAS_PER_BYTE * data_len) +
+            self.config.GAS_MULTI_TRANSFER_COST + 
+            self.config.GAS_RELAYED_COST
+        )
+        
+        # Buffer for Smart Contract execution (ESDT or SC calls)
+        if token_identifier != "EGLD" or data_string:
+            gas_limit += 10000000
+            
+        return gas_limit
+
+    def resolve_did_to_address(self, did: str) -> str:
+        """
+        Resolves a did:pkh:mvx:{chain_id}:{address} to a bech32 address.
+        """
+        parts = did.split(":")
+        if len(parts) >= 5 and parts[1] == "pkh" and parts[2] == "mvx":
+             return parts[4]
+        raise ValueError(f"Invalid MultiversX DID: {did}")
+
+    def _construct_transfer_data_string(self, token: str, amount: int, receiver: str) -> str:
+        """Helper to construct MultiESDTNFTTransfer data string."""
+        if token == "EGLD":
+            return ""
+            
+        dest_hex = Address.new_from_bech32(receiver).hex()
+        token_hex = token.encode().hex()
         amount_hex = hex(amount)[2:]
         if len(amount_hex) % 2 != 0:
             amount_hex = "0" + amount_hex
             
-        return f"ESDTTransfer@{token_hex}@{amount_hex}"
+        return f"MultiESDTNFTTransfer@{dest_hex}@01@{token_hex}@00@{amount_hex}"
 
-    def resolve_did_to_address(self, did: str) -> str:
-        """
-        Resolves a did:pkh:multiversx:1:<bech32> to a bech32 address.
-        """
-        # Format: did:pkh:mvx:{chain_id}:{address}
-        parts = did.split(":")
-        if len(parts) >= 4 and parts[1] == "pkh" and parts[2] == "mvx":
-             return parts[4]
-        raise ValueError(f"Invalid MultiversX DID: {did}")
+    def _decode_transaction_data(self, data: Union[str, bytes]) -> str:
+        """Safely decodes transaction data (handles base64 or plain string)."""
+        if not data:
+            return ""
+        if isinstance(data, bytes):
+            data = data.decode()
+        
+        # Heuristic: if it looks like MultiESDT, it's not encoded
+        if data.startswith("MultiESDT") or data.startswith("ESDT"):
+            return data
+            
+        try:
+            return base64.b64decode(data).decode()
+        except Exception:
+            return data
