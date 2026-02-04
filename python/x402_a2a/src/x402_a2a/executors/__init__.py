@@ -15,5 +15,6 @@
 
 from .base import x402BaseExecutor
 from .server import x402ServerExecutor
+from .multiversx_executor import MultiversXServerExecutor
 
-__all__ = ["x402BaseExecutor", "x402ServerExecutor"]
+__all__ = ["x402BaseExecutor", "x402ServerExecutor", "MultiversXServerExecutor"]

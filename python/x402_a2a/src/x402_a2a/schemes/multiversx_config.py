@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import dataclass
 
 @dataclass
@@ -35,3 +36,15 @@ class MultiversXConfig:
     
     # Chain Agnostic
     CAIP2_NAMESPACE: str = "mvx"
+
+    @classmethod
+    def from_env(cls) -> "MultiversXConfig":
+        return cls(
+            GAS_BASE_COST=int(os.getenv("MVX_GAS_BASE_COST", 50000)),
+            GAS_PER_BYTE=int(os.getenv("MVX_GAS_PER_BYTE", 1500)),
+            GAS_MULTI_TRANSFER_COST=int(os.getenv("MVX_GAS_MULTI_TRANSFER_COST", 200000)),
+            GAS_RELAYED_COST=int(os.getenv("MVX_GAS_RELAYED_COST", 50000)),
+            GAS_PRICE_DEFAULT=int(os.getenv("MVX_GAS_PRICE_DEFAULT", 1000000000)),
+            DEFAULT_TIMEOUT_SECONDS=int(os.getenv("MVX_DEFAULT_TIMEOUT_SECONDS", 600)),
+            MIN_TIMEOUT_SECONDS=int(os.getenv("MVX_MIN_TIMEOUT_SECONDS", 60)),
+        )
