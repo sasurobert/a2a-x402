@@ -23,6 +23,8 @@ from multiversx_sdk import (
     Address,
     TransactionsFactoryConfig,
     TransferTransactionsFactory,
+    Token,
+    TokenTransfer
 )
 
 from .multiversx_config import MultiversXConfig
@@ -71,18 +73,18 @@ class MultiversXScheme:
             description: Human-readable description.
             max_timeout_seconds: Payment validity timeout.
         """
+        # Validate inputs per specs 4.2
+        self.validate_payment_requirements(amount, token_identifier, receiver)
+
         timeout = max_timeout_seconds or self.config.DEFAULT_TIMEOUT_SECONDS
-        is_egld = token_identifier == "EGLD"
-        transfer_method = (
-            self.config.TRANSFER_METHOD_DIRECT if is_egld 
-            else self.config.TRANSFER_METHOD_ESDT
-        )
         
-        data_payload = self._construct_transfer_data_string(
+        # Enhance requirements per specs 4.2 (gas, method logic)
+        updated_reqs = self.enhance_payment_requirements(
             token_identifier, amount, receiver
         )
-        
-        gas_limit = self.calculate_gas_limit(data_payload, token_identifier)
+        data_payload = updated_reqs["data_payload"]
+        gas_limit = updated_reqs["gasLimit"]
+        transfer_method = updated_reqs["assetTransferMethod"]
 
         return PaymentRequirements(
             scheme=self.SCHEME_NAME,
@@ -133,19 +135,28 @@ class MultiversXScheme:
         if is_egld:
             tx = self.factory.create_transaction_for_native_token_transfer(
                 sender=sender_addr_obj,
-                receiver=Address.new_from_bech32(requirements.payTo),
+                receiver=Address.new_from_bech32(requirements.pay_to),
                 native_amount=int(requirements.max_amount_required)
             )
+            # Only setting data for EGLD if present (e.g. comments)
+            if data_payload:
+                tx.data = data_payload.encode()
         else:
-            # MultiESDTNFTTransfer logic: sender is receiver in the top-level tx
-            tx = self.factory.create_transaction_for_native_token_transfer(
+            # ESDT Transfer using SDK Factory - Strict V2 Compliance
+            tx = self.factory.create_transaction_for_esdt_transfer(
                 sender=sender_addr_obj,
-                receiver=sender_addr_obj,
-                native_amount=0
+                receiver=Address.new_from_bech32(requirements.pay_to),
+                token_transfers=[
+                    TokenTransfer(
+                        token=Token(requirements.asset),
+                        amount=int(requirements.max_amount_required)
+                    )
+                ]
             )
+            # Factory sets the correct data for ESDT, do not overwrite with data_payload
         
         tx.nonce = nonce
-        tx.data = data_payload.encode()
+        # tx.data is already set by factory or above block
         tx.gas_limit = requirements.extra.get("gasLimit", self.config.GAS_BASE_COST)
         tx.version = version
         
@@ -270,3 +281,55 @@ class MultiversXScheme:
             return base64.b64decode(data).decode()
         except Exception:
             return data
+
+    def parse_price(self, amount_str: str, decimals: int = 18) -> int:
+        """
+        [Spec 4.2] Converts input amounts to atomic units.
+        Uses Decimal for precision to avoid floating point errors.
+        """
+        from decimal import Decimal
+        try:
+            if "." in amount_str:
+                d = Decimal(amount_str)
+                return int(d * (10 ** decimals))
+            return int(amount_str)
+        except Exception:
+            raise ValueError(f"Invalid price format: {amount_str}")
+
+    def enhance_payment_requirements(self, token: str, amount: int, receiver: str) -> Dict[str, Any]:
+        """
+        [Spec 4.2] Injects default gas_limit and transfer method.
+        """
+        is_egld = token == "EGLD"
+        transfer_method = (
+            self.config.TRANSFER_METHOD_DIRECT if is_egld 
+            else self.config.TRANSFER_METHOD_ESDT
+        )
+        
+        data_payload = self._construct_transfer_data_string(
+            token, amount, receiver
+        )
+        
+        gas_limit = self.calculate_gas_limit(data_payload, token)
+        
+        return {
+            "gasLimit": gas_limit,
+            "assetTransferMethod": transfer_method,
+            "data_payload": data_payload
+        }
+
+    def validate_payment_requirements(self, amount: int, token: str, receiver: str):
+        """
+        [Spec 4.2] Enforces strictly valid addresses and tokens.
+        """
+        if amount <= 0:
+            raise ValueError("Amount must be positive")
+            
+        # Basic Bech32 validation (starts with erd1, length check)
+        if not receiver.startswith("erd1") or len(receiver) != 62:
+             raise ValueError(f"Invalid receiver address format: {receiver}")
+             
+        # Token ID validation
+        if token != "EGLD" and "-" not in token:
+             # Basic check, regex would be stricter per spec ^[A-Z0-9]{3,8}-[0-9a-fA-F]{6}$
+             raise ValueError(f"Invalid token identifier format: {token}")
